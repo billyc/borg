@@ -313,6 +313,8 @@ class Archive:
             key.compression_decider2 = CompressionDecider2(compression or CompressionSpec('none'))
             if name in manifest.archives:
                 raise self.AlreadyExists(name)
+            if name in manifest.tags:
+                raise self.AlreadyExists(name)
             self.last_checkpoint = time.monotonic()
             i = 0
             while True:
@@ -323,7 +325,13 @@ class Archive:
         else:
             info = self.manifest.archives.get(name)
             if info is None:
-                raise self.DoesNotExist(name)
+                # user may have specified a tag name instead of an archive
+                if name not in manifest.tags:
+                    raise self.DoesNotExist(name)
+                archive_from_tag = manifest.tags[name]
+                info = self.manifest.archives.get(archive_from_tag)
+                if info is None:
+                    raise self.DoesNotExist(name)
             self.load(info.id)
             self.zeros = b'\0' * (1 << chunker_params[1])
 

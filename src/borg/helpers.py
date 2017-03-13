@@ -218,7 +218,7 @@ class Manifest:
 
     MANIFEST_ID = b'\0' * 32
 
-    def __init__(self, key, repository, item_keys=None):
+    def __init__(self, key, repository, item_keys=None, tags={}):
         self.archives = Archives()
         self.config = {}
         self.key = key
@@ -226,6 +226,7 @@ class Manifest:
         self.item_keys = frozenset(item_keys) if item_keys is not None else ITEM_KEYS
         self.tam_verified = False
         self.timestamp = None
+        self.tags = tags
 
     @property
     def id_str(self):
@@ -254,6 +255,14 @@ class Manifest:
         if m.get('version') != 1:
             raise ValueError('Invalid manifest version')
         manifest.archives.set_raw_dict(m.archives)
+        # load tags, if they exist
+        clean_tags = {}
+        try:
+            for tag in m.tags: clean_tags[safe_decode(tag)] = safe_decode(m.tags[tag])
+        except (KeyError, AttributeError):
+            # old repos don't have any tags so this can happen but is harmless
+            pass
+        manifest.tags = clean_tags
         manifest.timestamp = m.get('timestamp')
         manifest.config = m.config
         # valid item keys are whatever is known in the repo or every key we know
@@ -269,6 +278,7 @@ class Manifest:
             if not manifest_required and security_required:
                 logger.debug('Manifest is TAM verified and says TAM is *not* required, updating security database...')
                 os.unlink(tam_required_file(repository))
+
         return manifest, key
 
     def write(self):
@@ -285,6 +295,7 @@ class Manifest:
         manifest = ManifestItem(
             version=1,
             archives=StableDict(self.archives.get_raw_dict()),
+            tags=self.tags,
             timestamp=self.timestamp,
             config=StableDict(self.config),
             item_keys=tuple(sorted(self.item_keys)),

@@ -41,7 +41,7 @@ from .helpers import location_validator, archivename_validator, ChunkerParams, C
 from .helpers import PrefixSpec, SortBySpec, HUMAN_SORT_KEYS
 from .helpers import BaseFormatter, ItemFormatter, ArchiveFormatter
 from .helpers import format_time, format_timedelta, format_file_size, format_archive
-from .helpers import safe_encode, remove_surrogates, bin_to_hex, prepare_dump_dict
+from .helpers import safe_encode, safe_decode, remove_surrogates, bin_to_hex, prepare_dump_dict
 from .helpers import prune_within, prune_split
 from .helpers import to_localtime, timestamp
 from .helpers import get_cache_dir
@@ -389,6 +389,34 @@ class Archiver:
             print(fmt % ('R', msg, total_size_MB / dt_extract, count, file_size_formatted, content, dt_extract))
             print(fmt % ('U', msg, total_size_MB / dt_update, count, file_size_formatted, content, dt_update))
             print(fmt % ('D', msg, total_size_MB / dt_delete, count, file_size_formatted, content, dt_delete))
+
+    @with_repository(exclusive=True)
+    def do_tag(self, args, repository, manifest, key, cache=None):
+        """Create or manage repository tags"""
+        if not hasattr(sys.stdout, 'buffer'):
+            # This is a shim for supporting unit tests replacing sys.stdout with e.g. StringIO,
+            # which doesn't have an underlying buffer (= lower file object).
+            def write(bytestring):
+                sys.stdout.write(bytestring.decode('utf-8', errors='replace'))
+        else:
+            write = sys.stdout.buffer.write
+
+        if args.output_list:
+            self._list_tags(args, manifest, write)
+            return self.exit_code
+
+        if 'tags' in args and args.location.archive:
+            tags = manifest.tags
+
+            for each in args.tags:
+                tags[each] = args.location.archive
+            manifest.tags.update(tags)
+
+            manifest.key = key
+            manifest.write()
+            repository.commit()
+
+        return self.exit_code
 
     @with_repository(fake='dry_run', exclusive=True)
     def do_create(self, args, repository, manifest=None, key=None):
@@ -893,8 +921,19 @@ class Archiver:
     @with_repository(exclusive=True, cache=True)
     @with_archive
     def do_rename(self, args, repository, manifest, key, cache, archive):
-        """Rename an existing archive"""
-        archive.rename(args.name)
+        """Rename an existing archive or tag"""
+        old_name = args.location.archive
+        new_name = args.name
+        if new_name in manifest.tags:
+            raise Archive.AlreadyExists(new_name)
+        if old_name in manifest.tags:
+            archive_name = manifest.tags[old_name]
+            manifest.tags.pop(old_name, None)
+            manifest.tags[new_name] = archive_name
+            logger.info('Renamed {} to {}.'.format(old_name, new_name))
+        else:
+            archive.rename(args.name)
+
         manifest.write()
         repository.commit()
         cache.commit()
@@ -902,7 +941,7 @@ class Archiver:
 
     @with_repository(exclusive=True, manifest=False)
     def do_delete(self, args, repository):
-        """Delete an existing repository or archives"""
+        """Delete an existing repository, archives, or tags"""
         if any((args.location.archive, args.first, args.last, args.prefix)):
             return self._delete_archives(args, repository)
         else:
@@ -923,6 +962,10 @@ class Archiver:
             deleted = False
             for i, archive_name in enumerate(archive_names, 1):
                 try:
+                    connected_tags = sorted([tag for tag,archive in manifest.tags.items() if archive==archive_name])
+                    for tag in connected_tags:
+                        manifest.tags.pop(tag, None)
+                        logger.info('Deleted {}.'.format(tag))
                     del manifest.archives[archive_name]
                 except KeyError:
                     self.exit_code = EXIT_WARNING
@@ -946,6 +989,21 @@ class Archiver:
         with Cache(repository, key, manifest, progress=args.progress, lock_wait=self.lock_wait) as cache:
             for i, archive_name in enumerate(archive_names, 1):
                 logger.info('Deleting {} ({}/{}):'.format(archive_name, i, len(archive_names)))
+                # delete tags first
+                if archive_name in manifest.tags:
+                    manifest.tags.pop(archive_name, None)
+                    manifest.write()
+                    repository.commit(save_space=args.save_space)
+                    logger.info("Tag deleted.")
+                    continue
+                # fail if there are dangling tags attached to this archive
+                connected_tags = sorted([tag for tag,archive in manifest.tags.items() if archive==archive_name])
+                if connected_tags:
+                    logger.error('Cannot delete archive with attached tags: '+ ' '.join(connected_tags))
+                    self.exit_code = EXIT_ERROR
+                    break
+
+                # delete the archive.
                 archive = Archive(repository, key, manifest, archive_name, cache=cache)
                 stats = Statistics()
                 archive.delete(stats, progress=args.progress, forced=args.forced)
@@ -1079,11 +1137,20 @@ class Archiver:
             else:
                 write(safe_encode(formatter.format_item(archive_info)))
 
+        # list tags, too
+        self._list_tags(args, manifest, write)
+
         if args.json:
             json_print(basic_json_data(manifest, extra={
                 'archives': output_data
             }))
 
+        return self.exit_code
+
+    def _list_tags(self, args, manifest, write):
+        for tag in sorted(manifest.tags):
+            msg = '{:36} --> {}\n'.format(tag, manifest.tags[tag])
+            write(safe_encode(msg))
         return self.exit_code
 
     @with_repository(cache=True)
@@ -1114,11 +1181,14 @@ class Archiver:
             if args.json:
                 output_data.append(info)
             else:
+                info['tags'] = ' '.join(sorted(
+                    [tag for tag,archive in manifest.tags.items() if archive==archive_name]))
                 info['duration'] = format_timedelta(timedelta(seconds=info['duration']))
                 info['command_line'] = format_cmdline(info['command_line'])
                 print(textwrap.dedent("""
                 Archive name: {name}
                 Archive fingerprint: {id}
+                Tags: {tags}
                 Comment: {comment}
                 Hostname: {hostname}
                 Username: {username}
@@ -2098,6 +2168,35 @@ class Archiver:
                                help="""show progress display while checking""")
         self.add_archives_filters_args(subparser)
 
+        # TAGS -------------------
+        tag_epilog = process_epilog("""
+        The tag command allows creating additional names which point to existing archives.
+
+        Once created, a tag can be used in place of the archive name anywhere that an
+        archive name is required in Borg.
+
+        Tags must be unique; two tags cannot have the same name. Multiple tags can point
+        to the same archive, however.
+
+        Archives with associated tags cannot be deleted until those tags are deleted first.
+        """)
+
+        subparser = subparsers.add_parser('tag', parents=[common_parser], add_help=False,
+                                          description=self.do_tag.__doc__,
+                                          epilog=tag_epilog,
+                                          formatter_class=argparse.RawDescriptionHelpFormatter,
+                                          help='create and manage archive tags')
+        subparser.set_defaults(func=self.do_tag)
+        subparser.add_argument('--list', '-l', dest='output_list', action='store_true',
+                               default=False,
+                               help='list existing tags')
+        subparser.add_argument('location', metavar='REPOSITORY_OR_ARCHIVE', nargs='?', default='',
+                               type=location_validator(),
+                               help='repository or archive to tag')
+        subparser.add_argument('tags', metavar='TAGS', nargs='*', type=str,
+                               help='tags to add to archive')
+
+        # ------------------------
         subparser = subparsers.add_parser('key', parents=[common_parser], add_help=False,
                                           description="Manage a keyfile or repokey of a repository",
                                           epilog="",
@@ -2528,25 +2627,25 @@ class Archiver:
                                    metavar='PATTERNFILE', help='read include/exclude patterns from PATTERNFILE, one per line')
 
         rename_epilog = process_epilog("""
-        This command renames an archive in the repository.
+        This command renames an archive or tag in the repository.
 
-        This results in a different archive ID.
+        Renaming an archive results in a different archive ID.
         """)
         subparser = subparsers.add_parser('rename', parents=[common_parser], add_help=False,
                                           description=self.do_rename.__doc__,
                                           epilog=rename_epilog,
                                           formatter_class=argparse.RawDescriptionHelpFormatter,
-                                          help='rename archive')
+                                          help='rename archive or tag')
         subparser.set_defaults(func=self.do_rename)
-        subparser.add_argument('location', metavar='ARCHIVE',
+        subparser.add_argument('location', metavar='ARCHIVE_OR_TAG',
                                type=location_validator(archive=True),
-                               help='archive to rename')
+                               help='existing archive or tag to rename')
         subparser.add_argument('name', metavar='NEWNAME',
                                type=archivename_validator(),
-                               help='the new archive name to use')
+                               help='the new name to use')
 
         delete_epilog = process_epilog("""
-        This command deletes an archive from the repository or the complete repository.
+        This command deletes an archive or tag from the repository or the complete repository.
         Disk space is reclaimed accordingly. If you delete the complete repository, the
         local cache for it (if any) is also deleted.
         """)
@@ -2554,7 +2653,7 @@ class Archiver:
                                           description=self.do_delete.__doc__,
                                           epilog=delete_epilog,
                                           formatter_class=argparse.RawDescriptionHelpFormatter,
-                                          help='delete archive')
+                                          help='delete archive, tag, or repository')
         subparser.set_defaults(func=self.do_delete)
         subparser.add_argument('-p', '--progress', dest='progress',
                                action='store_true', default=False,
@@ -2574,7 +2673,7 @@ class Archiver:
                                help='work slower, but using less space')
         subparser.add_argument('location', metavar='TARGET', nargs='?', default='',
                                type=location_validator(),
-                               help='archive or repository to delete')
+                               help='archive, tag, or repository to delete')
         self.add_archives_filters_args(subparser)
 
         list_epilog = process_epilog("""

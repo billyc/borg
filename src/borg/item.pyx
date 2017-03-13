@@ -316,12 +316,13 @@ class ManifestItem(PropDict):
     If a ManifestItem shall be serialized, give as_dict() method output to msgpack packer.
     """
 
-    VALID_KEYS = {'version', 'archives', 'timestamp', 'config', 'item_keys', }  # str-typed keys
+    VALID_KEYS = {'version', 'archives', 'timestamp', 'config', 'item_keys', 'tags', }  # str-typed keys
 
     __slots__ = ("_dict", )  # avoid setting attributes not supported by properties
 
     version = PropDict._make_property('version', int)
     archives = PropDict._make_property('archives', dict)  # name -> dict
+    tags = PropDict._make_property('tags', dict)  # tagname -> archive
     timestamp = PropDict._make_property('timestamp', str, 'surrogate-escaped str', encode=safe_encode, decode=safe_decode)
     config = PropDict._make_property('config', dict)
     item_keys = PropDict._make_property('item_keys', tuple)
